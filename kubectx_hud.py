@@ -16,8 +16,8 @@ default_config = {
     "update_interval_ms": 500,
     "transparency": 0.8,
     "window_position": {
-        "x": 100,
-        "y": 100
+        "x": 0,
+        "y": 0
     }
 }
 
