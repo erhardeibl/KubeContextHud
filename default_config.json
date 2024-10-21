@@ -1,0 +1,68 @@
+{
+    "text_formatting": {
+        "font_family": "Arial",
+        "font_size": 14,
+        "padding": 10
+    },
+    "language": {
+        "en": {
+            "context_label_text": "k8s ctx",
+            "context_label_delimiter": ": ",
+            "no_context_message": "No context available",
+            "pin_label": "Pin",
+            "unpin_label": "Unpin",
+            "exit_label": "Exit",
+            "set_language_label": "Language",
+            "set_color_scheme_label": "Color Scheme",
+            "keep_on_top_label": "Keep on Top"
+        },
+        "de": {
+            "context_label_text": "k8s Kontext",
+            "context_label_delimiter": ": ",
+            "no_context_message": "Kein Kontext verfügbar",
+            "pin_label": "Anheften",
+            "unpin_label": "Lösen",
+            "exit_label": "Beenden",
+            "set_language_label": "Sprache",
+            "set_color_scheme_label": "Farbschema",
+            "keep_on_top_label": "Immer im Vordergrund"
+        }
+    },
+    "color_scheme": "light",
+    "colors": {
+        "dark": {
+            "text_color": "white",
+            "background_color": "#2C3E50",
+            "exit_button_normal": "#8B0000",
+            "exit_button_hover": "#FF6347"
+        },
+        "light": {
+            "text_color": "black",
+            "background_color": "#ECF0F1",
+            "exit_button_normal": "#FF6347",
+            "exit_button_hover": "#FF4500"
+        },
+        "solarized_dark": {
+            "text_color": "#839496",
+            "background_color": "#002b36",
+            "exit_button_normal": "#dc322f",
+            "exit_button_hover": "#cb4b16"
+        },
+        "solarized_light": {
+            "text_color": "#657b83",
+            "background_color": "#fdf6e3",
+            "exit_button_normal": "#dc322f",
+            "exit_button_hover": "#cb4b16"
+        }
+    },
+    "behavior": {
+        "update_interval_ms": 500,
+        "window_transparency": 0.8,
+        "window_position": {
+            "x": 0,
+            "y": 0
+        },
+        "pinned": false,
+        "keep_on_top": true
+    }
+}
