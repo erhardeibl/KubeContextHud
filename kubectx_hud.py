@@ -320,6 +320,49 @@ class KubectlWorker(threading.Thread):
             self._results.put(snapshot)
 
 
+def enable_dpi_awareness():
+    """Render at the monitor's real resolution instead of being bitmap-stretched by Windows."""
+    if os.name != "nt":
+        return
+    import ctypes
+
+    try:
+        if ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+            return
+    except (OSError, AttributeError):
+        pass
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        return
+    except (OSError, AttributeError):
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except (OSError, AttributeError):
+        pass
+
+
+def monitor_dpi(root):
+    """DPI of the monitor currently showing the window."""
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            hwnd = ctypes.windll.user32.GetParent(root.winfo_id()) or root.winfo_id()
+            monitor = ctypes.windll.user32.MonitorFromWindow(hwnd, 2)
+            x, y = ctypes.c_uint(), ctypes.c_uint()
+            if (
+                ctypes.windll.shcore.GetDpiForMonitor(
+                    monitor, 0, ctypes.byref(x), ctypes.byref(y)
+                )
+                == 0
+            ):
+                return float(x.value)
+        except (OSError, AttributeError):
+            pass
+    return root.winfo_fpixels("1i")
+
+
 def screen_bounds(root):
     """Bounds of the whole virtual desktop so multi-monitor positions survive."""
     if os.name == "nt":
@@ -387,16 +430,20 @@ class Hud:
         self.context_var = tk.StringVar(value="")
 
         formatting = config.data["text_formatting"]
-        self.padding = int(formatting["padding"])
+        self._base_font_size = int(formatting["font_size"])
+        self._base_padding = int(formatting["padding"])
+        self._dpi = monitor_dpi(self.root)
+        self.scale = self._dpi / 96.0
+        self.padding = round(self._base_padding * self.scale)
         self.font = tkfont.Font(
-            family=formatting["font_family"], size=int(formatting["font_size"])
+            family=formatting["font_family"],
+            size=-round(self._base_font_size * self._dpi / 72.0),
         )
         self.label = tk.Label(self.root, text="", font=self.font, anchor=tk.CENTER)
         self.label.pack(fill=tk.BOTH, expand=True, padx=self.padding, pady=self.padding)
 
-        self.exit_button = tk.Frame(
-            self.root, width=EXIT_BUTTON_SIZE, height=EXIT_BUTTON_SIZE
-        )
+        button_size = round(EXIT_BUTTON_SIZE * self.scale)
+        self.exit_button = tk.Frame(self.root, width=button_size, height=button_size)
         self.exit_button.place_forget()
 
         self.apply_style()
@@ -534,6 +581,23 @@ class Hud:
     def update_label(self):
         self.label.configure(text=self.label_text())
 
+    def refresh_scaling(self):
+        """Follow Windows scaling changes and moves between monitors of differing DPI."""
+        dpi = monitor_dpi(self.root)
+        if abs(dpi - self._dpi) < 0.5:
+            return
+        self._dpi = dpi
+        self.scale = dpi / 96.0
+        # Menus use Tk's point-based system fonts, which track the scaling factor.
+        self.root.tk.call("tk", "scaling", dpi / 72.0)
+        self.padding = round(self._base_padding * self.scale)
+        self.font.configure(size=-round(self._base_font_size * dpi / 72.0))
+        self.label.pack_configure(padx=self.padding, pady=self.padding)
+        button_size = round(EXIT_BUTTON_SIZE * self.scale)
+        self.exit_button.configure(width=button_size, height=button_size)
+        self._geometry = None
+        self.apply_geometry()
+
     def drain_results(self):
         updated = False
         while True:
@@ -542,6 +606,7 @@ class Hud:
             except queue.Empty:
                 break
             updated = True
+        self.refresh_scaling()
         if updated:
             self.context_var.set(self.snapshot.current or "")
             self.update_label()
@@ -675,6 +740,7 @@ class Hud:
 
 
 def main():
+    enable_dpi_awareness()
     config = Config.load(CONFIG_PATH)
     if config.needs_rewrite:
         config.save()
