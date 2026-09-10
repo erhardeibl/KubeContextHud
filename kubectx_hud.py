@@ -1,428 +1,685 @@
+"""Draggable, always-on-top HUD that shows the active Kubernetes context."""
+
+from __future__ import annotations
+
+import copy
 import json
-import sys
-import subprocess
-import threading
+import os
+import queue
 import signal
+import subprocess
+import sys
+import threading
 import tkinter as tk
+from pathlib import Path
+from tkinter import font as tkfont
+from typing import NamedTuple
 
-# Constants for event bindings
-EVENT_START_MOVE = "<ButtonPress-1>"
-EVENT_STOP_MOVE = "<ButtonRelease-1>"
-EVENT_ON_MOTION = "<B1-Motion>"
-EVENT_SHOW_CONTEXT_MENU = "<Button-3>"
-EVENT_ON_ENTER = "<Enter>"
-EVENT_ON_LEAVE = "<Leave>"
-EVENT_EXIT_BUTTON_CLICK = "<Button-1>"
-EVENT_EXIT_BUTTON_ENTER = "<Enter>"
-EVENT_EXIT_BUTTON_LEAVE = "<Leave>"
-
-# File paths
-CONFIG_FILE_PATH = "config.json"
-DEFAULT_CONFIG_FILE_PATH = "default_config.json"
+APP_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = APP_DIR / "config.json"
 ENCODING = "utf-8"
-CREATE_NO_WINDOW = 0x08000000
 
-# Flag to check if context menu is open
-context_menu_open = False
+KUBECTL_TIMEOUT_S = 10.0
+DRAIN_INTERVAL_MS = 100
+REVEAL_TIMEOUT_MS = 3000
+MIN_POLL_INTERVAL_MS = 50
+EXIT_BUTTON_SIZE = 10
+WINDOWS_CREATE_NO_WINDOW = 0x08000000
 
-updates = 0
+ERROR_KUBECTL_MISSING = "kubectl_missing_message"
+ERROR_KUBECTL_TIMEOUT = "kubectl_timeout_message"
+ERROR_KUBECTL_FAILED = "kubectl_error_message"
 
+LEGACY_CONFIG_MARKER = "font_family"
 
-def load_config():
-    """Load default configuration and update with values from config.json."""
-    try:
-        with open(
-            DEFAULT_CONFIG_FILE_PATH, "r", encoding=ENCODING
-        ) as default_config_file:
-            config = json.load(default_config_file)
-    except (FileNotFoundError, json.JSONDecodeError) as e:
-        print(f"Error loading {DEFAULT_CONFIG_FILE_PATH}: {e}")
-        sys.exit(1)  # Exit if default configuration fails
-
-    try:
-        with open(CONFIG_FILE_PATH, "r", encoding=ENCODING) as config_file:
-            user_config = json.load(config_file)
-            config = update_config(
-                config, user_config
-            )  # Update default config with user config
-    except (FileNotFoundError, json.JSONDecodeError) as e:
-        print(f"Error loading {CONFIG_FILE_PATH}: {e}")
-
-    return config
-
-
-def update_config(default_config, user_config):
-    """Update default config with user config values."""
-    for key, value in user_config.items():
-        if isinstance(value, dict) and key in default_config:
-            default_config[key] = update_config(default_config[key], value)
-        elif key in default_config:
-            default_config[key] = value
-    return default_config
-
-
-def get_current_context():
-    """Get the current Kubernetes context."""
-    try:
-        result = subprocess.run(
-            ["kubectl", "config", "current-context"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            creationflags=CREATE_NO_WINDOW,
-        )
-        if result.returncode != 0:
-            raise subprocess.CalledProcessError(
-                result.returncode,
-                result.args,
-                output=result.stdout,
-                stderr=result.stderr,
-            )
-        return result.stdout.decode("utf-8").strip()
-    except subprocess.CalledProcessError:
-        return None
-
-
-def get_available_contexts():
-    """Get the available Kubernetes contexts."""
-    try:
-        result = subprocess.run(
-            ["kubectl", "config", "get-contexts", "-o", "name"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            creationflags=CREATE_NO_WINDOW,
-        )
-        if result.returncode != 0:
-            raise subprocess.CalledProcessError(
-                result.returncode,
-                result.args,
-                output=result.stdout,
-                stderr=result.stderr,
-            )
-        return result.stdout.decode("utf-8").strip().split("\n")
-    except subprocess.CalledProcessError:
-        return []
-
-
-def set_k8s_context(context):
-    """Set the Kubernetes context."""
-    try:
-        result = subprocess.run(
-            ["kubectl", "config", "use-context", context],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            creationflags=CREATE_NO_WINDOW,
-        )
-        if result.returncode != 0:
-            raise subprocess.CalledProcessError(
-                result.returncode,
-                result.args,
-                output=result.stdout,
-                stderr=result.stderr,
-            )
-    except subprocess.CalledProcessError as e:
-        print(f"Error setting context: {e}")
+DEFAULT_CONFIG = {
+    "text_formatting": {
+        "font_family": "Consolas",
+        "font_size": 13,
+        "padding": 10,
+    },
+    "language": "en",
+    "languages": {
+        "en": {
+            "no_context_message": "No context",
+            "kubectl_missing_message": "kubectl not found",
+            "kubectl_timeout_message": "kubectl timed out",
+            "kubectl_error_message": "Context unavailable",
+            "pin_label": "Pin",
+            "unpin_label": "Unpin",
+            "exit_label": "Exit",
+            "set_language_label": "Language",
+            "set_color_scheme_label": "Color Scheme",
+            "keep_on_top_label": "Keep on Top",
+            "settings_label": "Settings",
+            "contexts_label": "Contexts",
+        },
+        "de": {
+            "no_context_message": "Kein Kontext",
+            "kubectl_missing_message": "kubectl nicht gefunden",
+            "kubectl_timeout_message": "kubectl antwortet nicht",
+            "kubectl_error_message": "Kontext nicht verfügbar",
+            "pin_label": "Anheften",
+            "unpin_label": "Lösen",
+            "exit_label": "Beenden",
+            "set_language_label": "Sprache",
+            "set_color_scheme_label": "Farbschema",
+            "keep_on_top_label": "Immer im Vordergrund",
+            "settings_label": "Einstellungen",
+            "contexts_label": "Kontexte",
+        },
+    },
+    "color_scheme": "light",
+    "colors": {
+        "dark": {
+            "text_color": "white",
+            "background_color": "#2C3E50",
+            "exit_button_normal": "#8B0000",
+            "exit_button_hover": "#FF6347",
+        },
+        "light": {
+            "text_color": "black",
+            "background_color": "#ECF0F1",
+            "exit_button_normal": "#FF6347",
+            "exit_button_hover": "#FF4500",
+        },
+        "solarized_dark": {
+            "text_color": "#839496",
+            "background_color": "#002B36",
+            "exit_button_normal": "#DC322F",
+            "exit_button_hover": "#CB4B16",
+        },
+        "solarized_light": {
+            "text_color": "#657B83",
+            "background_color": "#FDF6E3",
+            "exit_button_normal": "#DC322F",
+            "exit_button_hover": "#CB4B16",
+        },
+    },
+    "behavior": {
+        "update_interval_ms": 500,
+        "window_transparency": 0.8,
+        "hover_transparency": 1.0,
+        "window_position": {"x": 0, "y": 0},
+        "pinned": False,
+        "keep_on_top": True,
+    },
+}
 
 
-def refresh_context_info():
-    """Update the context label with the current Kubernetes context."""
-    if not context_menu_open:
-        current_context = get_current_context()
-        if current_context:
-            context_label.config(
-                text=f"{context_label_text}{context_label_delimiter}{current_context}"
-            )
-            k8s_context_var.set(current_context)
+def deep_merge(base, override):
+    """Recursively overlay override onto base without mutating either."""
+    merged = dict(base)
+    for key, value in override.items():
+        current = merged.get(key)
+        if isinstance(value, dict) and isinstance(current, dict):
+            merged[key] = deep_merge(current, value)
         else:
-            context_label.config(
-                text=f"{context_label_text}{context_label_delimiter}{no_context_message}"
+            merged[key] = value
+    return merged
+
+
+def diff_from_defaults(data, defaults):
+    """Reduce data to only what differs from defaults, so config.json stays an override file."""
+    result = {}
+    for key, value in data.items():
+        base = defaults.get(key) if isinstance(defaults, dict) else None
+        if isinstance(value, dict) and isinstance(base, dict):
+            nested = diff_from_defaults(value, base)
+            if nested:
+                result[key] = nested
+        elif not isinstance(defaults, dict) or key not in defaults or value != base:
+            result[key] = value
+    return result
+
+
+class Config:
+    """User overrides layered on top of DEFAULT_CONFIG."""
+
+    def __init__(self, path, data):
+        self.path = path
+        self.data = data
+        self.needs_rewrite = False
+
+    @classmethod
+    def load(cls, path):
+        data = copy.deepcopy(DEFAULT_CONFIG)
+        stored = cls._read(path)
+        legacy = LEGACY_CONFIG_MARKER in stored
+        if legacy:
+            stored = {}  # pre-nested schema; its keys would corrupt the merged tree
+        if stored:
+            data = deep_merge(data, stored)
+        config = cls(path, data)
+        config.needs_rewrite = legacy or stored != diff_from_defaults(data, DEFAULT_CONFIG)
+        return config
+
+    @staticmethod
+    def _read(path):
+        try:
+            content = path.read_text(encoding=ENCODING)
+        except FileNotFoundError:
+            return {}
+        except OSError as error:
+            print(f"Cannot read {path}: {error}", file=sys.stderr)
+            return {}
+        try:
+            user = json.loads(content)
+        except json.JSONDecodeError as error:
+            print(f"Ignoring malformed {path}: {error}", file=sys.stderr)
+            return {}
+        return user if isinstance(user, dict) else {}
+
+    def save(self):
+        payload = diff_from_defaults(self.data, DEFAULT_CONFIG)
+        temporary = self.path.with_name(self.path.name + ".tmp")
+        try:
+            temporary.write_text(
+                json.dumps(payload, indent=4, ensure_ascii=False),
+                encoding=ENCODING,
             )
-    threaded_update_context_menu()
+            os.replace(temporary, self.path)
+            self.needs_rewrite = False
+        except OSError as error:
+            print(f"Cannot save {self.path}: {error}", file=sys.stderr)
+            temporary.unlink(missing_ok=True)
 
 
-def threaded_refresh_context_info():
-    """Run refresh_context_info in a new thread."""
-    threading.Thread(target=refresh_context_info).start()
+class ContextSnapshot(NamedTuple):
+    current: str | None
+    contexts: tuple[str, ...]
+    error: str | None
 
 
-def start_regular_updates():
-    """Start regular updates of the context info."""
-    root.after(
-        update_interval_ms,
-        lambda: [threaded_refresh_context_info(), start_regular_updates()],
+EMPTY_SNAPSHOT = ContextSnapshot(None, (), None)
+
+
+def _subprocess_kwargs():
+    if os.name == "nt":
+        return {"creationflags": WINDOWS_CREATE_NO_WINDOW}
+    return {}
+
+
+def run_kubectl(arguments):
+    """Return (stdout, error_key); error_key is None on success."""
+    try:
+        result = subprocess.run(
+            ["kubectl", *arguments],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=KUBECTL_TIMEOUT_S,
+            check=False,
+            **_subprocess_kwargs(),
+        )
+    except FileNotFoundError:
+        return "", ERROR_KUBECTL_MISSING
+    except subprocess.TimeoutExpired:
+        return "", ERROR_KUBECTL_TIMEOUT
+    except OSError as error:
+        print(f"kubectl failed: {error}", file=sys.stderr)
+        return "", ERROR_KUBECTL_FAILED
+
+    if result.returncode != 0:
+        message = result.stderr.decode(ENCODING, errors="replace").strip()
+        print(f"kubectl exited with {result.returncode}: {message}", file=sys.stderr)
+        return "", ERROR_KUBECTL_FAILED
+    return result.stdout.decode(ENCODING, errors="replace"), None
+
+
+def read_contexts():
+    """Read the current context and the full context list in one kubectl call."""
+    output, error = run_kubectl(["config", "view", "-o", "json"])
+    if error:
+        return ContextSnapshot(None, (), error)
+    try:
+        document = json.loads(output)
+    except json.JSONDecodeError:
+        return ContextSnapshot(None, (), ERROR_KUBECTL_FAILED)
+
+    entries = document.get("contexts") or []
+    names = tuple(
+        str(entry["name"])
+        for entry in entries
+        if isinstance(entry, dict) and entry.get("name")
     )
+    return ContextSnapshot(document.get("current-context") or None, names, None)
 
 
-def start_move(event):
-    """Start moving the window."""
-    if not pinned:
-        root.x = event.x
-        root.y = event.y
+def kubeconfig_paths():
+    configured = os.environ.get("KUBECONFIG")
+    if configured:
+        return [Path(part) for part in configured.split(os.pathsep) if part]
+    return [Path.home() / ".kube" / "config"]
 
 
-def stop_move(event):
-    """Stop moving the window."""
-    if not pinned:
-        root.x = None
-        root.y = None
-        threaded_save_window_position()
+def kubeconfig_fingerprint():
+    """Cheap stat-based signature used to skip kubectl calls when nothing changed."""
+    fingerprint = []
+    for path in kubeconfig_paths():
+        try:
+            status = path.stat()
+        except OSError:
+            fingerprint.append((str(path), None, None))
+        else:
+            fingerprint.append((str(path), status.st_mtime_ns, status.st_size))
+    return tuple(fingerprint)
 
 
-def on_motion(event):
-    """Handle window motion."""
-    if not pinned:
-        deltax = event.x - root.x
-        deltay = event.y - root.y
-        x = root.winfo_x() + deltax
-        y = root.winfo_y() + deltay
-        root.geometry(f"+{x}+{y}")
+class KubectlWorker(threading.Thread):
+    """Runs kubectl off the UI thread and publishes snapshots to a queue."""
+
+    def __init__(self, results, interval_ms):
+        super().__init__(name="kubectl-worker", daemon=True)
+        self._results = results
+        self._interval_s = max(int(interval_ms), MIN_POLL_INTERVAL_MS) / 1000.0
+        self._commands = queue.Queue()
+        self._wake = threading.Event()
+        self._stopping = threading.Event()
+        self._fingerprint = None
+        self._snapshot = None
+
+    def stop(self):
+        self._stopping.set()
+        self._wake.set()
+
+    def use_context(self, name):
+        self._commands.put(name)
+        self._wake.set()
+
+    def run(self):
+        while not self._stopping.is_set():
+            self._run_commands()
+            if self._stopping.is_set():
+                break
+            self._poll()
+            self._wake.wait(self._interval_s)
+            self._wake.clear()
+
+    def _run_commands(self):
+        while True:
+            try:
+                name = self._commands.get_nowait()
+            except queue.Empty:
+                return
+            _, error = run_kubectl(["config", "use-context", name])
+            self._fingerprint = None
+            if error:
+                self._publish((self._snapshot or EMPTY_SNAPSHOT)._replace(error=error))
+
+    def _poll(self):
+        fingerprint = kubeconfig_fingerprint()
+        if self._snapshot is not None and fingerprint == self._fingerprint:
+            return
+        snapshot = read_contexts()
+        self._fingerprint = fingerprint if snapshot.error is None else None
+        self._publish(snapshot)
+
+    def _publish(self, snapshot):
+        if snapshot != self._snapshot:
+            self._snapshot = snapshot
+            self._results.put(snapshot)
 
 
-def save_current_config():
-    with open(CONFIG_FILE_PATH, "w", encoding=ENCODING) as config_file:
-        json.dump(config, config_file, indent=4, ensure_ascii=False)
+def screen_bounds(root):
+    """Bounds of the whole virtual desktop so multi-monitor positions survive."""
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            metric = ctypes.windll.user32.GetSystemMetrics
+            left, top, width, height = metric(76), metric(77), metric(78), metric(79)
+            if width > 0 and height > 0:
+                return left, top, width, height
+        except (OSError, AttributeError):
+            pass
+    return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
 
 
-def save_window_position():
-    """Save the window position to the configuration."""
-    config["behavior"]["window_position"] = {"x": root.winfo_x(), "y": root.winfo_y()}
-    save_current_config()
+def clamp_position(x, y, width, height, bounds):
+    left, top, span_x, span_y = bounds
+    x = left if width >= span_x else min(max(x, left), left + span_x - width)
+    y = top if height >= span_y else min(max(y, top), top + span_y - height)
+    return x, y
 
 
-def threaded_save_window_position():
-    threading.Thread(target=save_window_position()).start()
+def scheme_colors(config):
+    schemes = config["colors"]
+    return schemes.get(config["color_scheme"]) or next(iter(schemes.values()))
 
 
-def signal_handler(sig, frame):
-    """Handle the SIGINT signal."""
-    print("Exiting...")
-    root.quit()
-    sys.exit(0)
+class Hud:
+    """The HUD window. Every Tk call happens on the thread that owns this object."""
 
+    def __init__(self, config):
+        self.config = config
+        self.snapshot = EMPTY_SNAPSHOT
+        self.results = queue.Queue()
 
-def toggle_pin():
-    """Toggle the pinned state of the window."""
-    global pinned
-    pinned = not pinned
-    config["behavior"]["pinned"] = pinned
-    save_current_config()
-    threaded_update_context_menu()
+        self._drag_offset = None
+        self._drag_origin = None
+        self._pressed = False
+        self._menu_contexts = None
+        self._menu_posted = False
+        self._hovering = False
+        self._visible = False
+        self._drain_job = None
+        self._closing = False
+        self._geometry = None
+        self.menu = None
+        self.contexts_menu = None
+        self.settings_menu = None
 
+        behavior = config.data["behavior"]
+        self.pinned = bool(behavior["pinned"])
+        self.idle_alpha = float(behavior["window_transparency"])
+        self.hover_alpha = float(behavior["hover_transparency"])
 
-def toggle_keep_on_top():
-    """Toggle the keep on top state of the window."""
-    global keep_on_top
-    keep_on_top = not keep_on_top
-    config["behavior"]["keep_on_top"] = keep_on_top
-    root.attributes("-topmost", keep_on_top)
-    save_current_config()
-    threaded_update_context_menu()
+        self.root = tk.Tk()
+        self.root.title("Kubernetes Context HUD")
+        self.root.overrideredirect(True)
+        self.root.attributes("-alpha", self.idle_alpha)
 
+        self.keep_on_top = tk.BooleanVar(value=bool(behavior["keep_on_top"]))
+        self.root.attributes("-topmost", self.keep_on_top.get())
 
-def update_context_menu():
-    """Update the context menu labels."""
-    if not context_menu_open:
-        context_menu.entryconfig(0, label=exit_label)
-        context_menu.entryconfig(1, label=unpin_label if pinned else pin_label)
-        context_menu.entryconfig(2, label=keep_on_top_label)
-        context_menu.entryconfig(3, label=set_language_label)
-        context_menu.entryconfig(4, label=set_color_scheme_label)
-        context_menu.entryconfig(5, label=context_label_text)
-        # Update the k8s context menu
-        k8s_context_menu.delete(0, tk.END)
-        for context in get_available_contexts():
-            k8s_context_menu.add_radiobutton(
-                label=context,
-                variable=k8s_context_var,
-                value=context,
-                command=lambda c=context: set_k8s_context(c),
+        self.language_var = tk.StringVar(value=config.data["language"])
+        self.color_scheme_var = tk.StringVar(value=config.data["color_scheme"])
+        self.context_var = tk.StringVar(value="")
+
+        formatting = config.data["text_formatting"]
+        self.padding = int(formatting["padding"])
+        self.font = tkfont.Font(
+            family=formatting["font_family"], size=int(formatting["font_size"])
+        )
+        self.label = tk.Label(self.root, text="", font=self.font, anchor=tk.CENTER)
+        self.label.pack(fill=tk.BOTH, expand=True, padx=self.padding, pady=self.padding)
+
+        self.exit_button = tk.Frame(
+            self.root, width=EXIT_BUTTON_SIZE, height=EXIT_BUTTON_SIZE
+        )
+        self.exit_button.place_forget()
+
+        self.apply_style()
+        self.rebuild_menu()
+        self.update_label()
+        self.bind_events()
+        self.apply_geometry()
+        self.root.withdraw()
+
+        self.worker = KubectlWorker(self.results, behavior["update_interval_ms"])
+
+    def text(self, key):
+        languages = self.config.data["languages"]
+        selected = languages.get(self.config.data["language"])
+        if selected is not None and key in selected:
+            return selected[key]
+        return DEFAULT_CONFIG["languages"]["en"].get(key, key)
+
+    def style(self):
+        return scheme_colors(self.config.data)
+
+    def bind_events(self):
+        self.root.bind("<ButtonPress-1>", self.start_move)
+        self.root.bind("<ButtonRelease-1>", self.stop_move)
+        self.root.bind("<B1-Motion>", self.on_motion)
+        self.root.bind("<Button-3>", self.show_menu)
+        self.root.bind("<Enter>", self.on_enter)
+        self.root.bind("<Leave>", self.on_leave)
+        self.exit_button.bind("<Button-1>", self.on_exit_click)
+        self.exit_button.bind("<Enter>", self.on_exit_enter)
+        self.exit_button.bind("<Leave>", self.on_exit_leave)
+
+    def apply_style(self):
+        style = self.style()
+        self.root.configure(bg=style["background_color"])
+        self.label.configure(
+            fg=style["text_color"], bg=style["background_color"]
+        )
+        self.exit_button.configure(bg=style["exit_button_normal"])
+
+    def label_text(self):
+        if self.snapshot.error:
+            return self.text(self.snapshot.error)
+        return self.snapshot.current or self.text("no_context_message")
+
+    def measure(self):
+        """Size to exactly the current context, shown in full."""
+        width = self.font.measure(self.label_text())
+        height = self.font.metrics("linespace")
+        return width + 2 * self.padding + 2, height + 2 * self.padding + 2
+
+    def apply_geometry(self):
+        width, height = self.measure()
+        position = self.config.data["behavior"]["window_position"]
+        x, y = clamp_position(
+            int(position.get("x", 0)),
+            int(position.get("y", 0)),
+            width,
+            height,
+            screen_bounds(self.root),
+        )
+        geometry = f"{width}x{height}+{x}+{y}"
+        if geometry != self._geometry:
+            self.root.geometry(geometry)
+            self._geometry = geometry
+
+    def rebuild_menu(self):
+        if self.menu is not None:
+            self.menu.destroy()
+
+        menu = tk.Menu(self.root, tearoff=0)
+        self.contexts_menu = tk.Menu(menu, tearoff=0)
+        menu.add_cascade(label=self.text("contexts_label"), menu=self.contexts_menu)
+        menu.add_separator()
+        menu.add_command(
+            label=self.text("unpin_label") if self.pinned else self.text("pin_label"),
+            command=self.toggle_pin,
+        )
+        self.settings_menu = self.build_settings_menu(menu)
+        menu.add_cascade(label=self.text("settings_label"), menu=self.settings_menu)
+        menu.add_separator()
+        menu.add_command(label=self.text("exit_label"), command=self.shutdown)
+
+        self.menu = menu
+        self._menu_contexts = None
+        self.refresh_contexts_menu()
+
+    def build_settings_menu(self, parent):
+        settings = tk.Menu(parent, tearoff=0)
+        settings.add_checkbutton(
+            label=self.text("keep_on_top_label"),
+            variable=self.keep_on_top,
+            command=self.toggle_keep_on_top,
+        )
+
+        language_menu = tk.Menu(settings, tearoff=0)
+        for name in sorted(self.config.data["languages"]):
+            language_menu.add_radiobutton(
+                label=name.upper(),
+                variable=self.language_var,
+                value=name,
+                command=lambda selected=name: self.set_language(selected),
             )
+        settings.add_cascade(label=self.text("set_language_label"), menu=language_menu)
+
+        scheme_menu = tk.Menu(settings, tearoff=0)
+        for name in sorted(self.config.data["colors"]):
+            scheme_menu.add_radiobutton(
+                label=name.replace("_", " ").title(),
+                variable=self.color_scheme_var,
+                value=name,
+                command=lambda selected=name: self.set_color_scheme(selected),
+            )
+        settings.add_cascade(
+            label=self.text("set_color_scheme_label"), menu=scheme_menu
+        )
+        return settings
+
+    def refresh_contexts_menu(self):
+        if self._menu_posted or self._menu_contexts == self.snapshot.contexts:
+            return
+        self.contexts_menu.delete(0, tk.END)
+        for name in self.snapshot.contexts:
+            self.contexts_menu.add_radiobutton(
+                label=name,
+                variable=self.context_var,
+                value=name,
+                command=lambda selected=name: self.request_context(selected),
+            )
+        self._menu_contexts = self.snapshot.contexts
+
+    def request_context(self, name):
+        self.worker.use_context(name)
+
+    def update_label(self):
+        self.label.configure(text=self.label_text())
+
+    def drain_results(self):
+        updated = False
+        while True:
+            try:
+                self.snapshot = self.results.get_nowait()
+            except queue.Empty:
+                break
+            updated = True
+        if updated:
+            self.context_var.set(self.snapshot.current or "")
+            self.update_label()
+            self.apply_style()
+            self.apply_geometry()
+            self.refresh_contexts_menu()
+            self.reveal()
+        self._drain_job = self.root.after(DRAIN_INTERVAL_MS, self.drain_results)
+
+    def reveal(self):
+        """Stay hidden until sized from real data, so the window never resizes on screen."""
+        if self._visible or self._closing:
+            return
+        self._visible = True
+        self.root.deiconify()
+        self.root.attributes("-topmost", self.keep_on_top.get())
+
+    def set_language(self, name):
+        self.config.data["language"] = name
+        self.config.save()
+        self.update_label()
+        self.apply_geometry()
+        self.root.after_idle(self.rebuild_menu)
+
+    def set_color_scheme(self, name):
+        self.config.data["color_scheme"] = name
+        self.config.save()
+        self.apply_style()
+
+    def toggle_pin(self):
+        self.pinned = not self.pinned
+        self.config.data["behavior"]["pinned"] = self.pinned
+        self.config.save()
+        self.root.after_idle(self.rebuild_menu)
+
+    def toggle_keep_on_top(self):
+        value = self.keep_on_top.get()
+        self.root.attributes("-topmost", value)
+        self.config.data["behavior"]["keep_on_top"] = value
+        self.config.save()
+
+    def post_menu(self, menu, event):
+        self._menu_posted = True
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+            self._menu_posted = False
+
+    def show_menu(self, event):
+        self.post_menu(self.menu, event)
+
+    def start_move(self, event):
+        self._pressed = True
+        self._drag_origin = (self.root.winfo_x(), self.root.winfo_y())
+        if self.pinned:
+            self._drag_offset = None
+            return
+        self._drag_offset = (
+            event.x_root - self.root.winfo_x(),
+            event.y_root - self.root.winfo_y(),
+        )
+
+    def on_motion(self, event):
+        if self.pinned or self._drag_offset is None:
+            return
+        x = event.x_root - self._drag_offset[0]
+        y = event.y_root - self._drag_offset[1]
+        self.root.geometry(f"+{x}+{y}")
+
+    def stop_move(self, _event):
+        if not self._pressed:
+            return
+        self._pressed = False
+        self._drag_offset = None
+        if (self.root.winfo_x(), self.root.winfo_y()) != self._drag_origin:
+            self.save_position()
+
+    def save_position(self):
+        self.config.data["behavior"]["window_position"] = {
+            "x": self.root.winfo_x(),
+            "y": self.root.winfo_y(),
+        }
+        self._geometry = None
+        self.config.save()
+
+    def on_enter(self, _event):
+        self.set_hover(True)
+
+    def on_leave(self, event):
+        widget = self.root.winfo_containing(event.x_root, event.y_root)
+        if widget is None or widget.winfo_toplevel() is not self.root:
+            self.set_hover(False)
+
+    def set_hover(self, hovering):
+        """Enter and Leave fire on every child crossing, so only act on real transitions."""
+        if hovering == self._hovering:
+            return
+        self._hovering = hovering
+        self.root.attributes("-alpha", self.hover_alpha if hovering else self.idle_alpha)
+        if hovering:
+            self.exit_button.place(x=0, y=0)
+        else:
+            self.exit_button.place_forget()
+
+    def on_exit_enter(self, _event):
+        self.exit_button.configure(bg=self.style()["exit_button_hover"])
+
+    def on_exit_leave(self, _event):
+        self.exit_button.configure(bg=self.style()["exit_button_normal"])
+
+    def on_exit_click(self, _event):
+        self.shutdown()
+
+    def shutdown(self, *_args):
+        if self._closing:
+            return
+        self._closing = True
+        self.worker.stop()
+        if self._drain_job is not None:
+            self.root.after_cancel(self._drain_job)
+            self._drain_job = None
+        self.root.destroy()
+
+    def run(self):
+        signal.signal(signal.SIGINT, lambda *_: self.shutdown())
+        self.worker.start()
+        self.drain_results()
+        self.root.after(REVEAL_TIMEOUT_MS, self.reveal)
+        self.root.mainloop()
 
 
-def threaded_update_context_menu():
-    """Run update_context_menu in a new thread."""
-    threading.Thread(target=update_context_menu).start()
+def main():
+    config = Config.load(CONFIG_PATH)
+    if config.needs_rewrite:
+        config.save()
+    Hud(config).run()
 
 
-def show_context_menu(event):
-    """Show the context menu."""
-    global context_menu_open
-    context_menu_open = True
-    context_menu.post(event.x_root, event.y_root)
-    context_menu_open = False
-
-
-def on_exit_button_click(event):
-    """Handle the exit button click."""
-    root.quit()
-    sys.exit(0)
-
-
-def on_enter(event):
-    """Handle mouse enter event."""
-    exit_button.place(x=0, y=0)
-
-
-def on_leave(event):
-    """Handle mouse leave event."""
-    if event.widget != exit_button:
-        exit_button.place_forget()
-
-
-def on_exit_button_enter(event):
-    """Handle mouse enter event on the exit button."""
-    exit_button.config(bg=exit_button_hover)
-    exit_button.place(x=0, y=0)
-
-
-def on_exit_button_leave(event):
-    """Handle mouse leave event on the exit button."""
-    exit_button.config(bg=exit_button_normal)
-    exit_button.place_forget()
-
-
-def set_language(lang):
-    """Set the language for the UI."""
-    global language, context_label_text, context_label_delimiter, no_context_message, pin_label, unpin_label, exit_label, set_language_label, set_color_scheme_label, keep_on_top_label
-    language = config["language"][lang]
-    context_label_text = language["context_label_text"]
-    context_label_delimiter = language["context_label_delimiter"]
-    no_context_message = language["no_context_message"]
-    pin_label = language["pin_label"]
-    unpin_label = language["unpin_label"]
-    exit_label = language["exit_label"]
-    set_language_label = language["set_language_label"]
-    set_color_scheme_label = language["set_color_scheme_label"]
-    keep_on_top_label = language["keep_on_top_label"]
-    threaded_update_context_menu()
-
-
-def set_color_scheme(scheme):
-    """Set the color scheme for the UI."""
-    global colors, text_color, background_color, exit_button_normal, exit_button_hover
-    config["color_scheme"] = scheme
-    colors = config["colors"][scheme]
-    text_color = colors["text_color"]
-    background_color = colors["background_color"]
-    exit_button_normal = colors["exit_button_normal"]
-    exit_button_hover = colors["exit_button_hover"]
-    canvas.config(bg=background_color)
-    context_label.config(fg=text_color, bg=background_color)
-    exit_button.config(bg=exit_button_normal)
-    color_scheme_var.set(scheme)
-
-
-# Load configuration
-config = load_config()
-
-# Extract config values
-text_formatting = config["text_formatting"]
-language = config["language"]["en"]  # Default to English
-color_scheme = config["color_scheme"]
-colors = config["colors"][color_scheme]
-behavior = config["behavior"]
-
-# Extract text formatting values
-font_family = text_formatting["font_family"]
-font_size = text_formatting["font_size"]
-padding = text_formatting["padding"]
-
-# Extract language values
-context_label_text = language["context_label_text"]
-context_label_delimiter = language["context_label_delimiter"]
-no_context_message = language["no_context_message"]
-pin_label = language["pin_label"]
-unpin_label = language["unpin_label"]
-exit_label = language["exit_label"]
-set_language_label = language["set_language_label"]
-set_color_scheme_label = language["set_color_scheme_label"]
-keep_on_top_label = language["keep_on_top_label"]
-
-# Extract color values
-text_color = colors["text_color"]
-background_color = colors["background_color"]
-exit_button_normal = colors["exit_button_normal"]
-exit_button_hover = colors["exit_button_hover"]
-
-# Extract behavior values
-update_interval_ms = behavior["update_interval_ms"]
-window_transparency = behavior["window_transparency"]
-window_position = behavior["window_position"]
-pinned = behavior["pinned"]
-keep_on_top = behavior["keep_on_top"]
-
-# Initialize the main window
-root = tk.Tk()
-keep_on_top = tk.BooleanVar(value=keep_on_top)  # Bind the variable to the checkbutton
-root.attributes("-topmost", keep_on_top.get())  # Keep the window on top
-root.overrideredirect(True)  # Hide the title bar
-root.attributes("-alpha", window_transparency)  # Set window transparency
-root.geometry(f"+{window_position['x']}+{window_position['y']}")  # Set window position
-
-# Create the canvas and context label
-canvas = tk.Canvas(root, bg=background_color, highlightthickness=0)
-canvas.pack(fill=tk.BOTH, expand=True)
-context_label = tk.Label(
-    canvas, text="", font=(font_family, font_size), fg=text_color, bg=background_color
-)
-context_label.pack(padx=padding, pady=padding)
-
-# Create the exit button
-exit_button = tk.Frame(root, bg=exit_button_normal, width=10, height=10)
-exit_button.place_forget()
-exit_button.bind(EVENT_EXIT_BUTTON_CLICK, on_exit_button_click)
-exit_button.bind(EVENT_EXIT_BUTTON_ENTER, on_exit_button_enter)
-exit_button.bind(EVENT_EXIT_BUTTON_LEAVE, on_exit_button_leave)
-
-# Bind events
-root.bind(EVENT_START_MOVE, start_move)
-root.bind(EVENT_STOP_MOVE, stop_move)
-root.bind(EVENT_ON_MOTION, on_motion)
-root.bind(EVENT_SHOW_CONTEXT_MENU, show_context_menu)
-canvas.bind(EVENT_ON_ENTER, on_enter)
-canvas.bind(EVENT_ON_LEAVE, on_leave)
-
-# Set up signal handler
-signal.signal(signal.SIGINT, signal_handler)
-
-# Create the context menu
-context_menu = tk.Menu(root, tearoff=0)
-context_menu.add_command(label=exit_label, command=root.quit)
-context_menu.add_command(label=pin_label, command=toggle_pin)
-context_menu.add_checkbutton(
-    label=keep_on_top_label, variable=keep_on_top, command=toggle_keep_on_top
-)
-
-# Add language options to the context menu
-language_menu = tk.Menu(context_menu, tearoff=0)
-language_var = tk.StringVar(value="en")
-for lang in config["language"].keys():
-    language_menu.add_radiobutton(
-        label=lang.upper(),
-        variable=language_var,
-        value=lang,
-        command=lambda l=lang: set_language(l),
-    )
-context_menu.add_cascade(label=set_language_label, menu=language_menu)
-
-# Add color scheme options to the context menu
-color_scheme_menu = tk.Menu(context_menu, tearoff=0)
-color_scheme_var = tk.StringVar(value=color_scheme)
-for scheme in config["colors"].keys():
-    color_scheme_menu.add_radiobutton(
-        label=scheme.capitalize(),
-        variable=color_scheme_var,
-        value=scheme,
-        command=lambda s=scheme: set_color_scheme(s),
-    )
-context_menu.add_cascade(label=set_color_scheme_label, menu=color_scheme_menu)
-
-# Add k8s context options to the context menu
-k8s_context_menu = tk.Menu(context_menu, tearoff=0)
-k8s_context_var = tk.StringVar(value=get_current_context())
-context_menu.add_cascade(label=context_label_text, menu=k8s_context_menu)
-
-# Start updating the context label
-start_regular_updates()
-
-# Run the main loop
-root.mainloop()
+if __name__ == "__main__":
+    main()
